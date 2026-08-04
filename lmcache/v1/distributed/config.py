@@ -244,6 +244,12 @@ class StorageManagerConfig:
     )
     """ The configuration for L2 adapters. """
 
+    retention_max_fraction: float = 0.0
+    """ Fraction of total L2 capacity that retention may shield from
+    eviction. 0 disables retention. When set, it must stay below every
+    adapter's trigger_watermark so the eviction loop always has
+    evictable keys. """
+
     store_policy: str = "default"
     """ The L2 store policy name. """
 

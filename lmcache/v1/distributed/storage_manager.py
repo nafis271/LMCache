@@ -34,6 +34,7 @@ from lmcache.v1.distributed.l2_adapters.reconfiguration import (
 )
 from lmcache.v1.distributed.l2_adapters.serde_wrapper import SerdeL2AdapterWrapper
 from lmcache.v1.distributed.quota_manager import QuotaManager
+from lmcache.v1.distributed.retention_manager import RetentionManager
 from lmcache.v1.distributed.serde import create_serde_processor
 from lmcache.v1.distributed.storage_controllers import (
     L1EvictionController,
@@ -106,6 +107,32 @@ class StorageManager:
         # reference. No explicit cleanup on close — the registry is
         # just a dict protected by a lock and has no OS resources.
         self._quota_manager = QuotaManager()
+
+        # Retention budget: a fraction of total L2 capacity, validated
+        # against each adapter's watermark so eviction can always find
+        # victims. Capacity is taken at boot; adapters added at runtime
+        # do not grow the budget.
+        l2_capacity_bytes = 0
+        for adapter_id, ac in zip(
+            self._l2_adapters, config.l2_adapter_config.adapters, strict=True
+        ):
+            if ac.eviction_config is None:
+                continue
+            if (
+                config.retention_max_fraction > 0
+                and config.retention_max_fraction
+                >= ac.eviction_config.trigger_watermark
+            ):
+                raise ValueError(
+                    f"retention_max_fraction ({config.retention_max_fraction}) "
+                    "must be below the L2 trigger_watermark "
+                    f"({ac.eviction_config.trigger_watermark})"
+                )
+            usage = self._l2_adapters[adapter_id].get_usage()
+            l2_capacity_bytes += max(0, usage.total_capacity_bytes)
+        self._retention_manager = RetentionManager(
+            max_retained_bytes=int(config.retention_max_fraction * l2_capacity_bytes)
+        )
 
         # Unified L2 eviction controller for all adapters with eviction
         # config. Aggregate-usage policies (``LRU``, ``noop``) need
@@ -774,6 +801,11 @@ class StorageManager:
         storage manager creates the registry at construction time.
         """
         return self._quota_manager
+
+    @property
+    def retention_manager(self) -> RetentionManager:
+        """The per-key retention registry shared by store and eviction."""
+        return self._retention_manager
 
     @property
     def l1_memory_desc(self) -> L1MemoryDesc:
