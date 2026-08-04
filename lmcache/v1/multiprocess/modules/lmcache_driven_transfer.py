@@ -74,6 +74,33 @@ tail-only group makes every earlier chunk unservable, so hits collapse to 0.
 """
 
 
+def _retained_chunk_keys(
+    obj_keys: list[ObjectKey],
+    keys_to_reserve: list[ObjectKey],
+    is_full_attention: bool,
+    start_token: int,
+    chunk_size: int,
+    bound_tokens: int,
+) -> list[ObjectKey]:
+    """Chunk keys a ttl store retains for one object group.
+
+    Full-attention groups retain the chunks fully inside the bound
+    (0 = whole prompt); chunk positions are absolute within the request,
+    offset by ``start_token``. Windowed groups retain their stored tail
+    unconditionally -- the tail is required to make any retained
+    boundary servable and is at most a window's worth of chunks.
+    """
+    if not is_full_attention:
+        return list(keys_to_reserve)
+    retained: list[ObjectKey] = []
+    for idx, obj_key in enumerate(obj_keys):
+        chunk_end = start_token + (idx + 1) * chunk_size
+        if bound_tokens and chunk_end > bound_tokens:
+            break
+        retained.append(obj_key)
+    return retained
+
+
 def get_layout_desc(
     cache_context: BaseCacheContext,
     num_tokens: int,
@@ -1075,6 +1102,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
             reserved_dict: dict[ObjectKey, MemoryObj] = {}
             all_dict: dict[ObjectKey, MemoryObj] = {}
+            retain_keys: list[ObjectKey] = []
+            retain_sizes: list[int] = []
             total_bytes: int = 0
             store_succeeded = False
             try:
@@ -1112,6 +1141,24 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                             iter(reserved_dict.values())
                         ).get_size() * len(reserved_dict)
 
+                    if key.retention_ttl_sec > 0:
+                        chunk_bytes = sum(
+                            s.numel() * d.itemsize
+                            for s, d in zip(
+                                layout_desc.shapes, layout_desc.dtypes, strict=True
+                            )
+                        )
+                        group_retained = _retained_chunk_keys(
+                            obj_keys,
+                            keys_to_reserve,
+                            store_attn_desc.is_full_attention(obj_group_id),
+                            key.start,
+                            self._ctx.chunk_size,
+                            key.retention_bound_tokens,
+                        )
+                        retain_keys.extend(group_retained)
+                        retain_sizes.extend([chunk_bytes] * len(group_retained))
+
                     # Keys not in reserved_dict (skipped by the storage manager)
                     # become None entries; the helper skips them for D2H.
                     memory_objs: list[MemoryObj | None] = [
@@ -1130,6 +1177,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     )
 
                 store_succeeded = True
+                if retain_keys:
+                    self._ctx.storage_manager.retention_manager.note_stored(
+                        retain_keys, retain_sizes, key.retention_ttl_sec
+                    )
             except Exception:
                 logger.exception("Cannot store keys due to exception")
                 return event.ipc_handle(), False
