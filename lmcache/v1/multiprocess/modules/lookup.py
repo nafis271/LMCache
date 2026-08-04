@@ -2,6 +2,7 @@
 """LookupModule: lookup, prefetch polling, and session lifecycle."""
 
 # Standard
+import os
 from dataclasses import dataclass
 from functools import partial
 import threading
@@ -9,9 +10,11 @@ import time
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.native_storage_ops import Bitmap, fold
 from lmcache.v1.distributed.api import (
     ObjectKey,
     PrefetchHandle,
+    TrimPolicy,
     ipc_key_to_object_keys,
 )
 from lmcache.v1.mp_observability.event import Event, EventType
@@ -68,6 +71,52 @@ def compute_extra_count(
     return tp - 1 if tp > world_size else 0
 
 
+SW_TAIL_ONLY_STORE = os.getenv("LMCACHE_SW_TAIL_ONLY_STORE", "0") == "1"
+"""Must match the store-side flag in lmcache_driven_transfer: windowed object
+groups are stored tail-only, so the hit length has to be reconciled per group
+instead of requiring every group on every chunk."""
+
+
+def _chunk_major_to_group_major(
+    found: "Bitmap", num_chunks: int, num_ranks: int, num_groups: int
+) -> "Bitmap":
+    """Lookup keys are chunk-major (``c*(G*R) + g*R + r``); fold wants
+    group-major (``g*(N*R) + c*R + r``)."""
+    out = Bitmap(max(1, num_groups * num_chunks * num_ranks))
+    stride = num_groups * num_ranks
+    for idx in found.get_indices_list():
+        chunk, rem = divmod(idx, stride)
+        group, rank = divmod(rem, num_ranks)
+        if chunk < num_chunks:
+            out.set(group * (num_chunks * num_ranks) + chunk * num_ranks + rank)
+    return out
+
+
+def _window_aware_hit_length(
+    found: "Bitmap",
+    num_chunks: int,
+    num_ranks: int,
+    group_windows: tuple[int, ...],
+) -> int:
+    """Model-wide prefix hit length in chunks under per-group window rules.
+
+    Each object group serves a length-``L`` prefix only if the chunks it depends
+    on are present (full attention: all of them; a ``w``-chunk window: the last
+    ``w``). ``fold`` intersects those per-group answers.
+
+    ``fold`` returns a size-``num_chunks`` bitmap whose bit ``j`` means "length
+    ``j + 1`` is servable", so the hit length is ``highest_set_bit() + 1`` and an
+    empty bitmap (``-1``) means no hit.
+    """
+    if num_chunks <= 0 or not group_windows:
+        return 0
+    group_major = _chunk_major_to_group_major(
+        found, num_chunks, num_ranks, len(group_windows)
+    )
+    servable = fold(group_major, num_chunks, num_ranks, list(group_windows))
+    return servable.highest_set_bit() + 1
+
+
 def _get_prefix_hit_length(
     found_prefix_len: int,
     world_size: int,
@@ -117,6 +166,10 @@ class _PrefetchJob:
     # emission time in ``query_prefetch_status``.
     requested_tokens: int
     num_object_groups: int = 1
+    # Window-aware reconciliation inputs (see _window_aware_hit_length). Empty
+    # group_windows or an all-full-attention model keeps the legacy path.
+    num_chunks: int = 0
+    group_windows: tuple[int, ...] = ()
     # Captured at lookup time so the ``MP_LOOKUP_PREFETCH_END`` event can
     # carry them as labels.  ``model_name`` lets dashboards slice hit rate
     # per model in multi-model deployments; ``cache_salt`` slices per
@@ -317,12 +370,17 @@ class LookupModule:
         )
         obj_keys = self._chunk_major_object_keys(key, chunk_hashes)
 
+        group_windows = tuple(attn_desc.num_chunks_in_sw)
+        windowed = SW_TAIL_ONLY_STORE and any(w >= 1 for w in group_windows)
+        # A tail-only windowed group leaves gaps before the tail; PREFIX would
+        # trim at the first gap and discard the tail we are trying to serve.
         handle = self._ctx.storage_manager.submit_prefetch_task(
             obj_keys,
             layout_desc,
             extra_count=extra_count,
             external_request_id=key.request_id,
             attn_desc=attn_desc,
+            policy=TrimPolicy.SPARSE if windowed else TrimPolicy.PREFIX,
         )
         self._register_prefetch_job(
             _PrefetchJob(
@@ -331,6 +389,8 @@ class LookupModule:
                 request_id=key.request_id,
                 requested_tokens=requested_tokens,
                 num_object_groups=attn_desc.num_object_groups,
+                num_chunks=len(chunk_hashes),
+                group_windows=group_windows if windowed else (),
                 model_name=model_name,
                 cache_salt=key.cache_salt,
             )
@@ -402,9 +462,14 @@ class LookupModule:
         # 1. the world size is the same between keys
         # 2. the lookup sort the keys in prefix order and breaks at the
         #    first failure
-        found_count = _get_prefix_hit_length(
-            found.count_leading_ones(), job.world_size, job.num_object_groups
-        )
+        if job.group_windows:
+            found_count = _window_aware_hit_length(
+                found, job.num_chunks, job.world_size, job.group_windows
+            )
+        else:
+            found_count = _get_prefix_hit_length(
+                found.count_leading_ones(), job.world_size, job.num_object_groups
+            )
 
         self._ctx.event_bus.publish(
             Event(

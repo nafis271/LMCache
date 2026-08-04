@@ -2,6 +2,7 @@
 """LMCache-driven KV cache transfer operations for the MPCacheServer."""
 
 # Standard
+import os
 from dataclasses import dataclass
 from itertools import islice
 from typing import Generator, Sequence
@@ -58,6 +59,19 @@ _HAS_NATIVE_OBJECT_GROUP_TRANSFER: bool = (
     lmc_ops.execute_object_group_transfer
     is not _python_ops_fallback.execute_object_group_transfer
 )
+
+
+SW_TAIL_ONLY_STORE = os.getenv("LMCACHE_SW_TAIL_ONLY_STORE", "0") == "1"
+"""Store windowed object groups only at the prefix tail.
+
+A windowed group of ``w`` chunks can only ever serve the last ``w`` chunks of a
+prefix (see ``fold``/``unfold`` in ``v1.distributed.bitmap_ops``), and retrieve
+already skips everything before that tail. Storing every chunk therefore writes
+one window snapshot per chunk boundary where only the tail is reachable.
+
+Requires the window-aware lookup path: with the require-all-groups trim policy a
+tail-only group makes every earlier chunk unservable, so hits collapse to 0.
+"""
 
 
 def get_layout_desc(
@@ -1064,6 +1078,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             total_bytes: int = 0
             store_succeeded = False
             try:
+                store_attn_desc = cache_context.kv_layer_groups_manager.get_attn_desc()
                 for obj_group_id in range(num_object_groups):
                     obj_keys = obj_keys_per_obj_group[obj_group_id]
                     layout_desc = get_layout_desc(
@@ -1071,8 +1086,25 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         self._ctx.chunk_size,
                         object_group_id=obj_group_id,
                     )
+                    keys_to_reserve = obj_keys
+                    if SW_TAIL_ONLY_STORE and not store_attn_desc.is_full_attention(
+                        obj_group_id
+                    ):
+                        sw_size_chunks = store_attn_desc.num_chunks_in_sw[obj_group_id]
+                        if sw_size_chunks >= 1:
+                            keys_to_reserve = obj_keys[
+                                max(0, len(obj_keys) - sw_size_chunks) :
+                            ]
+                            logger.debug(
+                                "Store: object group %d is windowed (%d chunks); "
+                                "reserving the last %d of %d chunk keys",
+                                obj_group_id,
+                                sw_size_chunks,
+                                len(keys_to_reserve),
+                                len(obj_keys),
+                            )
                     reserved_dict = self._ctx.storage_manager.reserve_write(
-                        obj_keys, layout_desc, "new"
+                        keys_to_reserve, layout_desc, "new"
                     )
                     all_dict.update(reserved_dict)
                     if reserved_dict:
@@ -1252,22 +1284,42 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
             prefetched_keys: list[ObjectKey] = []
             total_bytes = 0
+            retrieve_attn_desc = cache_context.kv_layer_groups_manager.get_attn_desc()
             try:
                 for obj_group_id in range(num_object_groups):
                     obj_keys = obj_keys_per_obj_group[obj_group_id]
+                    # Under tail-only storage a windowed group holds only its last
+                    # sw_size_chunks keys, so requiring every chunk here would fail
+                    # the whole retrieve *after* earlier groups already enqueued
+                    # their H2D copies, leaving the GPU blocks half-restored.
+                    lead_pad = 0
+                    if (
+                        SW_TAIL_ONLY_STORE
+                        and not retrieve_attn_desc.is_full_attention(obj_group_id)
+                    ):
+                        sw_size_chunks = retrieve_attn_desc.num_chunks_in_sw[
+                            obj_group_id
+                        ]
+                        if sw_size_chunks >= 1:
+                            lead_pad = max(0, len(obj_keys) - sw_size_chunks)
+                    keys_to_read = obj_keys[lead_pad:]
                     with self._ctx.storage_manager.read_prefetched_results(
-                        obj_keys
+                        keys_to_read
                     ) as memory_objs:
-                        if not memory_objs or len(memory_objs) != len(obj_keys):
+                        if not memory_objs or len(memory_objs) != len(keys_to_read):
                             logger.error("Some keys not found during retrieve!")
                             return event.ipc_handle(), False
 
                         total_bytes += sum(mo.get_size() for mo in memory_objs)
 
+                        # Positional: batch index must still map to chunk index, so
+                        # pad the skipped head with None. The H2D path skips exactly
+                        # lead_pad leading objects, so these are never dereferenced.
+                        positioned_objs = [None] * lead_pad + list(memory_objs)
                         transfer_kv_per_object_group(
                             cache_context,
                             block_ids_per_group_gpu,
-                            memory_objs,
+                            positioned_objs,
                             object_group_id=obj_group_id,
                             batch_size=cache_context.max_batch_size,
                             skip_first_n_tokens=skip_first_n_tokens,
@@ -1276,7 +1328,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         # Extend only after the copy is enqueued: on exception,
                         # read_prefetched_results releases this group's locks
                         # itself, and a key must not be released twice.
-                        prefetched_keys.extend(obj_keys)
+                        prefetched_keys.extend(keys_to_read)
             except Exception:
                 logger.exception("Cannot retrieve keys due to exception")
                 return event.ipc_handle(), False
