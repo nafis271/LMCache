@@ -74,6 +74,28 @@ tail-only group makes every earlier chunk unservable, so hits collapse to 0.
 """
 
 
+def _sw_reserve_indices(
+    num_chunks: int,
+    sw_size_chunks: int,
+    start_chunk: int,
+    bound_chunk: int,
+) -> list[int]:
+    """Chunk indices a windowed group reserves within one store op.
+
+    Always the op's trailing window (the only chunks a windowed group
+    can serve at the op's end boundary). A bounded retention store also
+    reserves the window ending at the bound boundary, so the retained
+    prefix stays servable at the breakpoint. Indices are local to the
+    op, which covers chunks [start_chunk, start_chunk + num_chunks).
+    """
+    indices = set(range(max(0, num_chunks - sw_size_chunks), num_chunks))
+    if bound_chunk > 0:
+        lo = max(0, bound_chunk - sw_size_chunks - start_chunk)
+        hi = min(num_chunks, bound_chunk - start_chunk)
+        indices.update(range(lo, hi))
+    return sorted(indices)
+
+
 def _retained_chunk_keys(
     obj_keys: list[ObjectKey],
     keys_to_reserve: list[ObjectKey],
@@ -1121,9 +1143,18 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     ):
                         sw_size_chunks = store_attn_desc.num_chunks_in_sw[obj_group_id]
                         if sw_size_chunks >= 1:
-                            keys_to_reserve = obj_keys[
-                                max(0, len(obj_keys) - sw_size_chunks) :
-                            ]
+                            bound_chunk = 0
+                            if key.retention_ttl_sec > 0 and key.retention_bound_tokens:
+                                bound_chunk = (
+                                    key.retention_bound_tokens // self._ctx.chunk_size
+                                )
+                            reserve_indices = _sw_reserve_indices(
+                                len(obj_keys),
+                                sw_size_chunks,
+                                key.start // self._ctx.chunk_size,
+                                bound_chunk,
+                            )
+                            keys_to_reserve = [obj_keys[i] for i in reserve_indices]
                             logger.debug(
                                 "Store: object group %d is windowed (%d chunks); "
                                 "reserving the last %d of %d chunk keys",

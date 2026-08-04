@@ -5,6 +5,7 @@
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
     _retained_chunk_keys,
+    _sw_reserve_indices,
 )
 
 CHUNK = 256
@@ -101,3 +102,33 @@ def test_windowed_group_retains_its_tail_unconditionally():
         bound_tokens=1024,
     )
     assert retained == tail
+
+
+def test_sw_indices_unbounded_is_trailing_window():
+    assert _sw_reserve_indices(8, 2, start_chunk=0, bound_chunk=0) == [6, 7]
+
+
+def test_sw_indices_bound_adds_breakpoint_window():
+    # bound at chunk 4: window [2, 4) plus the op tail [6, 8).
+    assert _sw_reserve_indices(8, 2, start_chunk=0, bound_chunk=4) == [2, 3, 6, 7]
+
+
+def test_sw_indices_bound_near_tail_dedups_overlap():
+    assert _sw_reserve_indices(8, 2, start_chunk=0, bound_chunk=7) == [5, 6, 7]
+
+
+def test_sw_indices_bound_straddles_increments():
+    # Global bound-tail is chunks [6, 8). First op covers chunks [0, 7):
+    # it holds only chunk 6 of the tail (plus its own trailing window).
+    assert _sw_reserve_indices(7, 2, start_chunk=0, bound_chunk=8) == [5, 6]
+    # Second op covers chunks [7, 11): it holds chunk 7 of the tail.
+    assert _sw_reserve_indices(4, 2, start_chunk=7, bound_chunk=8) == [0, 2, 3]
+
+
+def test_sw_indices_op_entirely_past_bound_tail():
+    # Op covers chunks [8, 12); bound-tail [2, 4) is far behind.
+    assert _sw_reserve_indices(4, 2, start_chunk=8, bound_chunk=4) == [2, 3]
+
+
+def test_sw_indices_window_larger_than_op():
+    assert _sw_reserve_indices(1, 4, start_chunk=0, bound_chunk=0) == [0]
