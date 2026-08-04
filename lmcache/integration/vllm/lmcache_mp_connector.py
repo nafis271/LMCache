@@ -210,6 +210,14 @@ class LMCacheMPRequestState(enum.Enum):
     READY = enum.auto()
 
 
+def _nonneg_int(value: Any) -> int:
+    """Coerce a kv_transfer_params entry to a non-negative int (0 if invalid)."""
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 @dataclass
 class LMCacheMPRequestTracker:
     # NOTE: this class used vLLM data structures, should be part of
@@ -242,9 +250,19 @@ class LMCacheMPRequestTracker:
 
     cache_salt: str = ""
 
+    # Explicit retention request parsed from kv_transfer_params; attached to
+    # every store of this request. 0 means no retention / no bound.
+    retention_ttl_sec: int = 0
+    retention_bound_tokens: int = 0
+
     def __init__(self, request: "Request"):
         self.request_id = request.request_id
         self.cache_salt: str = request.cache_salt or ""
+        params = getattr(request, "kv_transfer_params", None) or {}
+        self.retention_ttl_sec = _nonneg_int(params.get("lmcache_retention_ttl_sec"))
+        self.retention_bound_tokens = _nonneg_int(
+            params.get("lmcache_retention_bound_tokens")
+        )
         self.all_token_ids = request.all_token_ids
         self.allocated_block_ids = {}
         self.num_stored_tokens = 0
@@ -327,6 +345,8 @@ class LMCacheMPRequestMetadata:
     direction: Literal["STORE", "RETRIEVE"]
     op: LoadStoreOp
     cache_salt: str = ""
+    retention_ttl_sec: int = 0
+    retention_bound_tokens: int = 0
 
     @staticmethod
     def GetStoreMetadata(
@@ -414,6 +434,8 @@ class LMCacheMPRequestMetadata:
                 direction="STORE",
                 op=op,
                 cache_salt=tracker.cache_salt,
+                retention_ttl_sec=tracker.retention_ttl_sec,
+                retention_bound_tokens=tracker.retention_bound_tokens,
             )
 
             # Update the request tracker
@@ -849,12 +871,16 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         request_ids = []
         ops = []
         cache_salts = []
+        retention_ttl_secs = []
+        retention_bound_tokens = []
         for meta in metadata.requests:
             if meta.direction != "STORE":
                 continue
             request_ids.append(meta.request_id)
             ops.append(meta.op)
             cache_salts.append(meta.cache_salt)
+            retention_ttl_secs.append(meta.retention_ttl_sec)
+            retention_bound_tokens.append(meta.retention_bound_tokens)
 
         if len(request_ids) == 0:
             return
@@ -864,7 +890,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             event.record()
 
         self.worker_adapter.batched_submit_store_requests(
-            request_ids, ops, event, cache_salts=cache_salts
+            request_ids,
+            ops,
+            event,
+            cache_salts=cache_salts,
+            retention_ttl_secs=retention_ttl_secs,
+            retention_bound_tokens=retention_bound_tokens,
         )
 
     # TODO: How does lmcache driven path handle preemption?
