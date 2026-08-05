@@ -105,6 +105,11 @@ class RetentionManager:
             )
         return accepted
 
+    @property
+    def max_retained_bytes(self) -> int:
+        """The configured retention byte budget (0 = retention disabled)."""
+        return self._max_retained_bytes
+
     def is_evictable(self, key: ObjectKey) -> bool:
         """False while the key's retention window is still open."""
         with self._lock:

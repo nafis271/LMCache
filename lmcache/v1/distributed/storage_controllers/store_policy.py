@@ -10,6 +10,7 @@ The store policy makes two decisions after data is written to L1:
 # Standard
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
@@ -17,6 +18,10 @@ from lmcache.v1.distributed.l2_adapters.config import (
     L2AdapterConfigBase,
     get_type_name_for_config,
 )
+
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.v1.distributed.retention_manager import RetentionManager
 
 
 @dataclass(frozen=True)
@@ -55,6 +60,9 @@ class StorePolicy(ABC):
     2. Which keys to delete from L1 after successful L2 store
        (select_l1_deletions).
     """
+
+    requires_retention_manager: bool = False
+    """Whether ``create_store_policy`` must inject a RetentionManager."""
 
     @abstractmethod
     def select_store_targets(
@@ -122,23 +130,34 @@ def get_registered_store_policies() -> list[str]:
     return list(_STORE_POLICY_REGISTRY)
 
 
-def create_store_policy(name: str) -> StorePolicy:
+def create_store_policy(
+    name: str,
+    retention_manager: "RetentionManager | None" = None,
+) -> StorePolicy:
     """
     Create a store policy instance by name.
 
     Args:
         name: Registered policy name.
+        retention_manager: Injected into policies that declare
+            ``requires_retention_manager``.
 
     Returns:
         A new StorePolicy instance.
 
     Raises:
-        ValueError: If no policy is registered under the given name.
+        ValueError: If no policy is registered under the given name, or a
+            policy requiring a retention manager is created without one.
     """
     if name not in _STORE_POLICY_REGISTRY:
         known = ", ".join(sorted(_STORE_POLICY_REGISTRY)) or "(none)"
         raise ValueError(f"Unknown store policy {name!r}. Known: {known}")
-    return _STORE_POLICY_REGISTRY[name]()
+    policy_cls = _STORE_POLICY_REGISTRY[name]
+    if policy_cls.requires_retention_manager:
+        if retention_manager is None:
+            raise ValueError(f"Store policy {name!r} requires a retention manager")
+        return policy_cls(retention_manager)  # type: ignore[call-arg]
+    return policy_cls()
 
 
 class DefaultStorePolicy(StorePolicy):
@@ -209,5 +228,34 @@ class BufferOnlyStorePolicy(DefaultStorePolicy):
         return list(keys)
 
 
+class RetainedOnlyStorePolicy(DefaultStorePolicy):
+    """
+    Store only retention-shielded keys to L2, never delete from L1.
+
+    Makes the L2 tier hold exactly the explicitly retained data. Keys are
+    selected by their retention state at the moment the store controller
+    sees them; a retention store stamps its keys before finish_write
+    publishes them, so its own keys are always visible here. Keys another
+    request retains later are re-queued via StoreController.request_store.
+    """
+
+    requires_retention_manager = True
+
+    def __init__(self, retention_manager: "RetentionManager") -> None:
+        self._retention = retention_manager
+
+    def select_store_targets(
+        self,
+        keys: list[ObjectKey],
+        adapters: list[AdapterDescriptor],
+    ) -> dict[int, list[ObjectKey]]:
+        """Store only the retained subset of ``keys``, to all adapters."""
+        retained = [key for key in keys if self._retention.is_retained(key)]
+        if not retained:
+            return {}
+        return {ad.index: list(retained) for ad in adapters}
+
+
 register_store_policy("default", DefaultStorePolicy)
 register_store_policy("skip_l1", BufferOnlyStorePolicy)
+register_store_policy("retained_only", RetainedOnlyStorePolicy)

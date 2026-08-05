@@ -1220,6 +1220,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     self._ctx.storage_manager.retention_manager.note_stored(
                         retain_keys, retain_sizes, key.retention_ttl_sec
                     )
+                    adopted = [k for k in retain_keys if k not in all_dict]
+                    if adopted:
+                        # Chunks this request retains but an earlier store
+                        # wrote: queue an L2 store so the promise is
+                        # disk-backed under selective store policies.
+                        self._ctx.storage_manager.request_l2_store(adopted)
             except Exception:
                 logger.exception("Cannot store keys due to exception")
                 return event.ipc_handle(), False

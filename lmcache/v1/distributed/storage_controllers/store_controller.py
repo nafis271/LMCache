@@ -320,6 +320,16 @@ class StoreController(StorageControllerInterface):
         self._listener.close()
         self._adapter_ctrl_efd.close()
 
+    def request_store(self, keys: list[ObjectKey]) -> None:
+        """Queue keys for policy evaluation and L2 store outside the L1
+        write-finished flow (e.g. retention adopting already-cached keys).
+
+        Keys that are no longer readable in L1 are skipped by the store
+        path, so callers need not pre-check residency.
+        """
+        if keys:
+            self._listener.on_l1_keys_write_finished(keys)
+
     def report_status(self) -> dict:
         """Return a status dict for the store controller."""
         is_healthy = self._thread.is_alive()
