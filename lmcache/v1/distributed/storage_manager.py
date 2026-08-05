@@ -157,11 +157,21 @@ class StorageManager:
         # Controllers receive the initial set as ordered lists; they key
         # their own copies by ``descriptor.index`` (== adapter_id) and learn
         # of later changes via add_adapter/request_remove_adapter.
+        if (
+            config.store_policy == "retained_only"
+            and self._retention_manager.max_retained_bytes == 0
+        ):
+            raise ValueError(
+                "store_policy 'retained_only' needs retention_max_fraction > 0 "
+                "and an eviction-enabled L2 adapter; nothing would reach L2"
+            )
         self._store_controller = StoreController(
             l1_manager=self._l1_manager,
             l2_adapters=list(self._l2_adapters.values()),
             adapter_descriptors=list(self._adapter_descriptors.values()),
-            policy=create_store_policy(config.store_policy),
+            policy=create_store_policy(
+                config.store_policy, retention_manager=self._retention_manager
+            ),
         )
         self._store_controller.start()
 
@@ -818,6 +828,15 @@ class StorageManager:
     def retention_manager(self) -> RetentionManager:
         """The per-key retention registry shared by store and eviction."""
         return self._retention_manager
+
+    def request_l2_store(self, keys: list[ObjectKey]) -> None:
+        """Queue L1-resident keys for an L2 store outside the write path.
+
+        Used when retention adopts keys an earlier request already wrote:
+        selective store policies never saw them as retained, so the L2
+        copy that backs the retention promise must be requested explicitly.
+        """
+        self._store_controller.request_store(keys)
 
     @property
     def l1_memory_desc(self) -> L1MemoryDesc:
