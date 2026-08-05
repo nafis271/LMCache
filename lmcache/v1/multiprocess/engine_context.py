@@ -2,6 +2,7 @@
 """Shared context and layout descriptor registry for engine modules."""
 
 # Standard
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TypedDict
 import threading
@@ -46,6 +47,12 @@ class _LayoutDescEntry:
     """Cross-chunk attention windows of all object groups, in object-group
     order. Defaults to a single full-attention group."""
 
+    layout_descs: tuple[MemoryLayoutDesc, ...] = ()
+    """Per-object-group layout descriptors, in object-group order. Object
+    groups can have different chunk layouts (hybrid models), so consumers
+    that allocate buffers for arbitrary groups need every group's layout.
+    Empty means only ``layout_desc`` (group 0) is known."""
+
 
 class LayoutDescRegistry:
     """Thread-safe registry mapping (model_name, world_size) to MemoryLayoutDesc.
@@ -68,6 +75,7 @@ class LayoutDescRegistry:
         world_size: int,
         layout_desc: MemoryLayoutDesc,
         attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC,
+        layout_descs: Sequence[MemoryLayoutDesc] | None = None,
     ) -> None:
         """Register a layout descriptor for a (model_name, world_size) pair.
 
@@ -80,8 +88,12 @@ class LayoutDescRegistry:
             layout_desc: The memory layout descriptor.
             attn_desc: Cross-chunk attention windows of all object groups, in
                 object-group order. Defaults to a single full-attention group.
+            layout_descs: Per-object-group layout descriptors, in object-group
+                order. Required for multi-group models whose groups have
+                different chunk layouts; omit for single-group models.
         """
         key = (model_name, world_size)
+        descs = tuple(layout_descs) if layout_descs else ()
         with self._lock:
             entry = self._registry.get(key)
             if entry is None:
@@ -89,11 +101,13 @@ class LayoutDescRegistry:
                     layout_desc=layout_desc,
                     ref_count=1,
                     attn_desc=attn_desc,
+                    layout_descs=descs,
                 )
                 return
 
             entry.layout_desc = layout_desc
             entry.attn_desc = attn_desc
+            entry.layout_descs = descs
             entry.ref_count += 1
 
     def unregister(self, model_name: str, world_size: int) -> None:
@@ -133,6 +147,22 @@ class LayoutDescRegistry:
             if entry is None:
                 return None
             return entry.layout_desc
+
+    def find_group_layouts(
+        self, model_name: str, world_size: int
+    ) -> tuple[MemoryLayoutDesc, ...] | None:
+        """Look up the per-object-group layout descriptors for a pair.
+
+        Returns:
+            The registered per-group descriptors; a 1-tuple of the single
+            registered descriptor when no per-group list was provided;
+            None if the pair is unknown.
+        """
+        with self._lock:
+            entry = self._registry.get((model_name, world_size))
+            if entry is None:
+                return None
+            return entry.layout_descs or (entry.layout_desc,)
 
     def find_attn_desc(self, model_name: str, world_size: int) -> AttnWindowDesc:
         """Look up the attention-window descriptor for a pair.

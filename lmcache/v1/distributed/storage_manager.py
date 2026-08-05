@@ -4,6 +4,7 @@ Distributed multi-tier storage manager for MP mode
 """
 
 # Standard
+from collections.abc import Sequence
 from contextlib import contextmanager
 from typing import Iterator, Literal, Optional
 import threading
@@ -435,12 +436,17 @@ class StorageManager:
         attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC,
         skip_l2: bool = False,
         mode: PrefetchMode = PrefetchMode.LOOKUP,
+        layout_descs: Sequence[MemoryLayoutDesc] | None = None,
     ) -> PrefetchHandle:
         """Prefetch objects into L1 asynchronously.
 
         Args:
             keys: Object keys to prefetch.
             layout_desc: Memory layout description.
+            layout_descs: Per-object-group layouts, in object-group order.
+                Required when ``keys`` span object groups with different
+                layouts; when omitted, ``layout_desc`` is used for every
+                key.
             extra_count: Extra workers (on top of the default
                 1) that will independently retrieve the same
                 key.  Total locks = 1 + extra_count.
@@ -471,6 +477,7 @@ class StorageManager:
                     extra_count=extra_count,
                     policy=policy,
                     mode=mode,
+                    layout_descs=layout_descs,
                 )
             return PrefetchHandle(
                 prefetch_request_id=prefetch_request_id,
@@ -525,6 +532,7 @@ class StorageManager:
                     policy=TrimPolicy.SPARSE,
                     attn_desc=attn_desc,
                     mode=mode,
+                    layout_descs=layout_descs,
                 )
             return PrefetchHandle(
                 prefetch_request_id=prefetch_request_id,

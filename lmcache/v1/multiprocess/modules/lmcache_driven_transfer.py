@@ -944,13 +944,21 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             separate_object_groups=self._ctx.separate_object_groups,
             full_sw_kv=self._ctx.full_sw_kv,
         )
-        layout_desc = get_layout_desc(
-            cache_context, self._ctx.chunk_size, object_group_id=0
-        )
         kv_groups_manager = cache_context.kv_layer_groups_manager
         attn_desc = kv_groups_manager.get_attn_desc()
+        # Object groups can have different chunk layouts (hybrid models);
+        # register every group's layout so the prefetch path can allocate
+        # correctly sized L1 buffers for any group's keys.
+        layout_descs = [
+            get_layout_desc(cache_context, self._ctx.chunk_size, object_group_id=g)
+            for g in range(kv_groups_manager.num_object_groups)
+        ]
         self._ctx.layout_desc_registry.register(
-            model_name, world_size, layout_desc, attn_desc
+            model_name,
+            world_size,
+            layout_descs[0],
+            attn_desc,
+            layout_descs=layout_descs,
         )
 
         with self._lock:

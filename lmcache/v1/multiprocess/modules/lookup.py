@@ -368,6 +368,9 @@ class LookupModule:
         attn_desc = self._ctx.layout_desc_registry.find_attn_desc(
             model_name, world_size
         )
+        layout_descs = self._ctx.layout_desc_registry.find_group_layouts(
+            model_name, world_size
+        )
         obj_keys = self._chunk_major_object_keys(key, chunk_hashes)
 
         group_windows = tuple(attn_desc.num_chunks_in_sw)
@@ -381,6 +384,7 @@ class LookupModule:
             external_request_id=key.request_id,
             attn_desc=attn_desc,
             policy=TrimPolicy.SPARSE if windowed else TrimPolicy.PREFIX,
+            layout_descs=layout_descs,
         )
         self._register_prefetch_job(
             _PrefetchJob(

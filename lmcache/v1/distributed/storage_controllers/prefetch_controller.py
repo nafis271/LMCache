@@ -14,6 +14,7 @@ The controller runs a background thread with an event-driven loop that:
 
 # Standard
 from collections import Counter, defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Iterable
 import enum
@@ -156,6 +157,11 @@ class InFlightPrefetchRequest:
     loaded keys permanent and acquires no read lock; ``LOOKUP`` defers
     retention to the policy and read-locks loaded keys."""
 
+    layout_descs: tuple[MemoryLayoutDesc, ...] = ()
+    """Per-object-group layouts for L1 write-buffer allocation, in
+    object-group order. Empty falls back to ``layout_desc`` for every
+    key (uniform-layout models)."""
+
     # Lookup phase: adapter_idx -> task_id (removed as results arrive)
     pending_lookup_tasks: dict[int, L2TaskId] = field(default_factory=dict)
     # Lookup phase: adapter_idx -> bitmap (populated as results arrive)
@@ -248,6 +254,7 @@ class PrefetchController(StorageControllerInterface):
                 TrimPolicy,
                 AttnWindowDesc,
                 PrefetchMode,
+                tuple[MemoryLayoutDesc, ...],
             ]
         ] = []
 
@@ -268,6 +275,7 @@ class PrefetchController(StorageControllerInterface):
                 TrimPolicy,
                 AttnWindowDesc,
                 PrefetchMode,
+                tuple[MemoryLayoutDesc, ...],
             ]
         ] = []
         self._next_request_id: PrefetchRequestId = 0
@@ -353,6 +361,7 @@ class PrefetchController(StorageControllerInterface):
         policy: TrimPolicy = TrimPolicy.PREFIX,
         attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC,
         mode: PrefetchMode = PrefetchMode.LOOKUP,
+        layout_descs: Sequence[MemoryLayoutDesc] | None = None,
     ) -> PrefetchRequestId:
         """
         Submit a prefetch request for the given keys.
@@ -372,6 +381,10 @@ class PrefetchController(StorageControllerInterface):
             keys: List of object keys to prefetch from L2 into L1.
                 The ordering defines the prefix: index 0 is the first key.
             layout_desc: Memory layout for L1 write buffer allocation.
+            layout_descs: Per-object-group layouts, in object-group order.
+                Required when ``keys`` span object groups with different
+                layouts; when omitted, ``layout_desc`` is used for every
+                key.
             extra_count: Extra read locks per key (on top of the default 1)
                 to acquire when transitioning loaded keys from write-locked
                 to read-locked.  Must match the ``extra_count`` used in the
@@ -393,7 +406,16 @@ class PrefetchController(StorageControllerInterface):
             request_id = self._next_request_id
             self._next_request_id += 1
             self._submission_queue.append(
-                (request_id, keys, layout_desc, extra_count, policy, attn_desc, mode)
+                (
+                    request_id,
+                    keys,
+                    layout_desc,
+                    extra_count,
+                    policy,
+                    attn_desc,
+                    mode,
+                    tuple(layout_descs) if layout_descs else (),
+                )
             )
         self._submission_efd.notify()
         return request_id
@@ -777,12 +799,26 @@ class PrefetchController(StorageControllerInterface):
         while (
             self._pending_queue and len(self._in_flight_requests) < self._max_in_flight
         ):
-            request_id, keys, layout_desc, extra_count, policy, attn_desc, mode = (
-                self._pending_queue.pop(0)
-            )
+            (
+                request_id,
+                keys,
+                layout_desc,
+                extra_count,
+                policy,
+                attn_desc,
+                mode,
+                layout_descs,
+            ) = self._pending_queue.pop(0)
             self._status_pending_count -= 1
             self._start_lookup_phase(
-                request_id, keys, layout_desc, extra_count, policy, attn_desc, mode
+                request_id,
+                keys,
+                layout_desc,
+                extra_count,
+                policy,
+                attn_desc,
+                mode,
+                layout_descs,
             )
 
     # =========================================================================
@@ -798,6 +834,7 @@ class PrefetchController(StorageControllerInterface):
         policy: TrimPolicy = TrimPolicy.PREFIX,
         attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC,
         mode: PrefetchMode = PrefetchMode.LOOKUP,
+        layout_descs: tuple[MemoryLayoutDesc, ...] = (),
     ) -> None:
         """Submit lookup_and_lock to all live (non-draining) adapters for a
         new request."""
@@ -826,6 +863,7 @@ class PrefetchController(StorageControllerInterface):
             policy=policy,
             attn_desc=attn_desc,
             mode=mode,
+            layout_descs=layout_descs,
             pending_lookup_tasks=pending_lookup_tasks,
         )
         self._in_flight_requests[request_id] = request
@@ -847,6 +885,19 @@ class PrefetchController(StorageControllerInterface):
     # =========================================================================
     # Load phase
     # =========================================================================
+    @staticmethod
+    def _layout_for_group(
+        request: InFlightPrefetchRequest, group_id: int
+    ) -> MemoryLayoutDesc:
+        """Layout for one object group's L1 buffers.
+
+        Falls back to the request's single layout when no per-group list
+        was provided (uniform-layout models) or the id is out of range.
+        """
+        if 0 <= group_id < len(request.layout_descs):
+            return request.layout_descs[group_id]
+        return request.layout_desc
+
     def _transition_to_load_phase(self, request: InFlightPrefetchRequest) -> None:
         """Compute load plan, reserve L1 buffers, and submit load tasks."""
         request.phase = PrefetchPhase.PLAN_AND_LOAD
@@ -902,12 +953,24 @@ class PrefetchController(StorageControllerInterface):
             retentions = self._policy.select_l1_retentions(
                 keys_to_reserve,
             )
-        write_results = l1_mgr.reserve_write(
-            keys=keys_to_reserve,
-            is_temporary=[not r for r in retentions],
-            layout_desc=request.layout_desc,
-            mode="new",
-        )
+        # Reserve per object group: groups can have different chunk layouts
+        # (hybrid models), and a single layout would allocate wrong-sized
+        # buffers for every other group's keys.
+        write_results: dict[ObjectKey, tuple[L1Error, "MemoryObj | None"]] = {}
+        keys_by_group: dict[int, tuple[list[ObjectKey], list[bool]]] = {}
+        for key, retained_flag in zip(keys_to_reserve, retentions, strict=True):
+            bucket = keys_by_group.setdefault(key.object_group_id, ([], []))
+            bucket[0].append(key)
+            bucket[1].append(not retained_flag)
+        for group_id, (group_keys, group_temps) in keys_by_group.items():
+            write_results.update(
+                l1_mgr.reserve_write(
+                    keys=group_keys,
+                    is_temporary=group_temps,
+                    layout_desc=self._layout_for_group(request, group_id),
+                    mode="new",
+                )
+            )
 
         # Step 4: filter to successfully reserved keys
         reserved_key_set: set[ObjectKey] = set()
@@ -983,12 +1046,8 @@ class PrefetchController(StorageControllerInterface):
             )
             request.pending_load_tasks[adapter_idx] = task_id
             # Per-adapter byte accounting for L2_LOAD_TASK_* throughput
-            # events.  Uniform layout per chunk -> size * count.
-            total_bytes = (
-                per_adapter_objs[0].get_size() * len(per_adapter_objs)
-                if per_adapter_objs
-                else 0
-            )
+            # events. Object sizes vary per object group, so sum them.
+            total_bytes = sum(obj.get_size() for obj in per_adapter_objs)
             request.load_bytes_by_adapter[adapter_idx] = total_bytes
 
             self._event_bus.publish(
