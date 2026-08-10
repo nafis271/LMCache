@@ -144,6 +144,10 @@ class RetentionManager:
                 return True
             return entry[0] <= self._clock()
 
+    def is_retained(self, key: ObjectKey) -> bool:
+        """True while the key's retention window is still open."""
+        return not self.is_evictable(key)
+
     def forget(self, keys: list[ObjectKey]) -> None:
         """Drop entries for keys deleted outside the eviction loop.
 

@@ -44,8 +44,15 @@ def test_batched_store_fans_out_per_request_retention():
     adapter = _bare_worker_adapter()
     calls = []
 
-    def fake_submit(request_id, op, event, cache_salt="", retention_ttl_sec=0):
-        calls.append((request_id, cache_salt, retention_ttl_sec))
+    def fake_submit(
+        request_id,
+        op,
+        event,
+        cache_salt="",
+        retention_ttl_sec=0,
+        retention_bound_tokens=0,
+    ):
+        calls.append((request_id, cache_salt, retention_ttl_sec, retention_bound_tokens))
 
     adapter.submit_store_request = fake_submit
 
@@ -55,8 +62,9 @@ def test_batched_store_fans_out_per_request_retention():
         object(),
         cache_salts=["", "s"],
         retention_ttl_secs=[0, 3600],
+        retention_bound_tokens=[0, 5120],
     )
-    assert calls == [("a", "", 0), ("b", "s", 3600)]
+    assert calls == [("a", "", 0, 0), ("b", "s", 3600, 5120)]
 
 
 def test_batched_store_defaults_mean_no_retention():
@@ -64,8 +72,15 @@ def test_batched_store_defaults_mean_no_retention():
     adapter = _bare_worker_adapter()
     calls = []
 
-    def fake_submit(request_id, op, event, cache_salt="", retention_ttl_sec=0):
-        calls.append((request_id, cache_salt, retention_ttl_sec))
+    def fake_submit(
+        request_id,
+        op,
+        event,
+        cache_salt="",
+        retention_ttl_sec=0,
+        retention_bound_tokens=0,
+    ):
+        calls.append((request_id, cache_salt, retention_ttl_sec, retention_bound_tokens))
 
     adapter.submit_store_request = fake_submit
 
@@ -75,4 +90,4 @@ def test_batched_store_defaults_mean_no_retention():
         object(),
         cache_salts=["", "s"],
     )
-    assert calls == [("a", "", 0), ("b", "s", 0)]
+    assert calls == [("a", "", 0, 0), ("b", "s", 0, 0)]
