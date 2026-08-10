@@ -62,10 +62,12 @@ class IPCCacheServerKey:
 
     # === Explicit retention request (not part of cache identity) ===
     # A store carrying a nonzero ttl asks the server to shield the written
-    # chunks from eviction until the window expires. msgspec encodes
-    # dataclasses as maps, so payloads that predate this field decode with
-    # the default (no retention).
+    # chunks from eviction until the window expires. A nonzero bound limits
+    # the shield to chunks fully inside the first bound tokens (0 = whole
+    # prompt). msgspec encodes dataclasses as maps, so payloads that predate
+    # these fields decode with the defaults (no retention).
     retention_ttl_sec: int = field(compare=False, default=0)
+    retention_bound_tokens: int = field(compare=False, default=0)
 
     # Duplicated from ObjectKey — cannot import ObjectKey here due to
     # circular dependency (api.py imports IPCCacheServerKey).
@@ -83,9 +85,11 @@ class IPCCacheServerKey:
                 f"cache_salt exceeds max length {self._SALT_MAX_LEN} "
                 f"(got {len(self.cache_salt)})"
             )
-        if self.retention_ttl_sec < 0:
+        if self.retention_ttl_sec < 0 or self.retention_bound_tokens < 0:
             raise ValueError(
-                f"retention_ttl_sec must be non-negative (got {self.retention_ttl_sec})"
+                "retention_ttl_sec and retention_bound_tokens must be "
+                f"non-negative (got {self.retention_ttl_sec}, "
+                f"{self.retention_bound_tokens})"
             )
 
     # Helper function for unit tests only
@@ -125,6 +129,7 @@ class IPCCacheServerKey:
             request_id=self.request_id,
             cache_salt=self.cache_salt,
             retention_ttl_sec=self.retention_ttl_sec,
+            retention_bound_tokens=self.retention_bound_tokens,
         )
 
 

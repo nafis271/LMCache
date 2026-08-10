@@ -69,9 +69,11 @@ class LMCacheMPRequestTracker:
 
     cache_salt: str = ""
 
-    # Retention ttl parsed from kv_transfer_params; attached to every
-    # store of this request. 0 means no retention.
+    # Retention params parsed from kv_transfer_params; attached to every
+    # store of this request. ttl 0 means no retention; bound 0 retains the
+    # whole prompt, a nonzero bound retains only chunks fully inside it.
     retention_ttl_sec: int = 0
+    retention_bound_tokens: int = 0
 
     mm_adjusted_prompt_ids: list[int] = field(default_factory=list)
 
@@ -85,6 +87,12 @@ class LMCacheMPRequestTracker:
             )
         except (TypeError, ValueError, OverflowError):
             self.retention_ttl_sec = 0
+        try:
+            self.retention_bound_tokens = max(
+                0, int(params.get("lmcache_retention_bound_tokens", 0))
+            )
+        except (TypeError, ValueError, OverflowError):
+            self.retention_bound_tokens = 0
         self.all_token_ids = request.all_token_ids
         self.allocated_block_ids = {}
         self.num_stored_tokens = 0
@@ -183,6 +191,7 @@ class LMCacheMPRequestMetadata:
     op: LoadStoreOp
     cache_salt: str = ""
     retention_ttl_sec: int = 0
+    retention_bound_tokens: int = 0
 
     @staticmethod
     def GetStoreMetadata(
@@ -271,6 +280,7 @@ class LMCacheMPRequestMetadata:
                 op=op,
                 cache_salt=tracker.cache_salt,
                 retention_ttl_sec=tracker.retention_ttl_sec,
+                retention_bound_tokens=tracker.retention_bound_tokens,
             )
 
             # Update the request tracker

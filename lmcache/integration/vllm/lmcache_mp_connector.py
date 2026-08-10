@@ -572,6 +572,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         ops = []
         cache_salts = []
         retention_ttl_secs = []
+        retention_bound_tokens = []
         for meta in metadata.requests:
             if meta.direction != "STORE":
                 continue
@@ -579,6 +580,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             ops.append(meta.op)
             cache_salts.append(meta.cache_salt)
             retention_ttl_secs.append(meta.retention_ttl_sec)
+            retention_bound_tokens.append(meta.retention_bound_tokens)
 
         if len(request_ids) == 0:
             if self.dispatcher is not None:
@@ -594,6 +596,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             event,
             cache_salts=cache_salts,
             retention_ttl_secs=retention_ttl_secs,
+            retention_bound_tokens=retention_bound_tokens,
         )
         if self.dispatcher is not None:
             dispatch(self.dispatcher, "wait_for_save", event=event)

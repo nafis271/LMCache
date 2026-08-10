@@ -1166,13 +1166,20 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     if key.retention_ttl_sec > 0:
                         # A ttl store also extends already-present chunks;
                         # keys that failed reservation hold no data and are
-                        # not shielded.
-                        group_retain = [
-                            k
-                            for k in obj_keys
-                            if k in reserved_dict
-                            or self._ctx.storage_manager.has_l1_object(k)
-                        ]
+                        # not shielded. A nonzero bound retains only chunks
+                        # fully inside the first bound tokens.
+                        group_retain = []
+                        for idx, k in enumerate(obj_keys):
+                            chunk_end = key.start + (idx + 1) * self._ctx.chunk_size
+                            if (
+                                key.retention_bound_tokens
+                                and chunk_end > key.retention_bound_tokens
+                            ):
+                                break
+                            if k in reserved_dict or (
+                                self._ctx.storage_manager.has_l1_object(k)
+                            ):
+                                group_retain.append(k)
                         chunk_bytes = sum(
                             shape.numel() * dtype.itemsize
                             for shape, dtype in zip(
