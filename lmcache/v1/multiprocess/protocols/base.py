@@ -66,6 +66,7 @@ class RequestType(enum.Enum):
 
     # Observability operations
     REPORT_BLOCK_ALLOCATION = enum.auto()
+    DRAIN_KV_EVENTS = enum.auto()
 
     # Debug operations
     NOOP = enum.auto()

@@ -8,12 +8,16 @@ This module defines protocols for:
 """
 
 # First Party
-from lmcache.v1.multiprocess.custom_types import BlockAllocationRecord
+from lmcache.v1.multiprocess.custom_types import (
+    BlockAllocationRecord,
+    KvEventDrainRecord,
+)
 from lmcache.v1.multiprocess.protocols.base import HandlerType, ProtocolDefinition
 
 # Define request names for this protocol group
 REQUEST_NAMES = [
     "REPORT_BLOCK_ALLOCATION",
+    "DRAIN_KV_EVENTS",
 ]
 
 
@@ -35,5 +39,13 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
             payload_classes=[int, str, list[BlockAllocationRecord]],
             response_class=None,
             handler_type=HandlerType.BLOCKING,
+        ),
+        # Drain queued Dynamo KV events (connector-sink mode)
+        # Payload: [] (none)
+        # Returns: list[KvEventDrainRecord] - queued events, oldest first
+        "DRAIN_KV_EVENTS": ProtocolDefinition(
+            payload_classes=[],
+            response_class=list[KvEventDrainRecord],
+            handler_type=HandlerType.SYNC,
         ),
     }

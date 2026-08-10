@@ -4,6 +4,7 @@
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 import math
+import os
 import sys
 
 # Third Party
@@ -936,10 +937,45 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         Take the KV cache events from the connector.
 
+        When the LMCache server runs with ``--dynamo-kv-sink connector``,
+        this drains its queued CPU-tier events and returns them as vLLM
+        ``BlockStored`` / ``BlockRemoved`` so the scheduler publishes them on
+        the engine's own KV-event stream (same port/seq space as GPU events,
+        ring-buffer + /kv_recover recovery included).
+
+        Enabled via env ``LMCACHE_KV_EVENTS_SINK=connector`` (set by entry.sh
+        alongside the server flag) so deployments without the feature never
+        pay the drain roundtrip.
+
         Yields:
             New KV cache events since the last call.
         """
-        return ()
+        if os.environ.get("LMCACHE_KV_EVENTS_SINK") != "connector":
+            return ()
+        if not hasattr(self, "scheduler_adapter"):
+            return ()
+        # Late import: vllm is always importable here (we run inside it).
+        from vllm.distributed.kv_events import BlockRemoved, BlockStored
+
+        events: list[KVCacheEvent] = []
+        for rec in self.scheduler_adapter.drain_kv_events():
+            if rec.kind == "stored":
+                events.append(
+                    BlockStored(
+                        block_hashes=rec.block_hashes,
+                        parent_block_hash=rec.parent_hash,
+                        token_ids=rec.token_ids,
+                        block_size=rec.block_size,
+                        lora_id=None,
+                        medium=rec.medium,
+                        lora_name=None,
+                    )
+                )
+            elif rec.kind == "removed":
+                events.append(
+                    BlockRemoved(block_hashes=rec.block_hashes, medium=rec.medium)
+                )
+        return events
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:

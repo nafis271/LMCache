@@ -932,6 +932,43 @@ class LMCacheMPSchedulerAdapter:
                 [base_key, self.tp_size],
             )
 
+    def drain_kv_events(self) -> list:
+        """Drain queued Dynamo KV events from the server(s), pipelined.
+
+        Non-blocking for the caller: each call collects the futures submitted
+        by the PREVIOUS call (if resolved) and submits fresh drain requests.
+        The one-step delay is irrelevant for KV events and keeps the
+        scheduler loop from ever waiting on the MP roundtrip.
+
+        Returns:
+            KvEventDrainRecords collected from the previous cycle, oldest
+            first per server; [] when unhealthy or nothing pending.
+        """
+        if not self.is_healthy:
+            return []
+        records: list = []
+        pending = getattr(self, "_pending_drain_futures", None)
+        if pending is not None:
+            for fut in pending:
+                try:
+                    if fut.query():
+                        records.extend(fut.result(timeout=0))
+                    # not done: drop it -- the server keeps queuing; the next
+                    # drain picks everything up. Never block the scheduler.
+                except Exception:  # noqa: BLE001 -- drain must never raise
+                    logger.warning(
+                        "Dynamo KV event drain failed; skipping", exc_info=True
+                    )
+        self._pending_drain_futures = [
+            send_lmcache_request(
+                self.mq_clients[url],
+                RequestType.DRAIN_KV_EVENTS,
+                [],
+            )
+            for url in self._server_urls
+        ]
+        return records
+
     def end_session(self, request_id: str) -> None:
         """
         Notify LMCache server to remove the session for a finished request.

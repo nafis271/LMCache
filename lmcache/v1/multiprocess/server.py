@@ -32,6 +32,7 @@ from lmcache.v1.mp_observability.gc_monitor import (
     init_gc_monitor,
     shutdown_gc_monitor,
 )
+from lmcache.v1.mp_observability.dynamo.setup import setup_dynamo_kv_publishing
 from lmcache.v1.mp_observability.trace import maybe_initialize_trace_recorder
 from lmcache.v1.multiprocess.config import (
     DEFAULT_COORDINATOR_CONFIG,
@@ -395,6 +396,9 @@ def run_cache_server(
         separate_object_groups=mp_config.separate_object_groups,
         full_sw_kv=is_blend,
     )
+
+    # Optional Dynamo KV-event publishing.
+    setup_dynamo_kv_publishing(ctx, obs_config, event_bus)
 
     modules = _build_modules(ctx, mp_config, coordinator_config)
     engine = MPCacheServer(ctx, modules)

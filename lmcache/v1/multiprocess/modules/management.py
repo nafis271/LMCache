@@ -8,7 +8,10 @@ import threading
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.mp_observability.event import Event, EventType
-from lmcache.v1.multiprocess.custom_types import BlockAllocationRecord
+from lmcache.v1.multiprocess.custom_types import (
+    BlockAllocationRecord,
+    KvEventDrainRecord,
+)
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 from lmcache.v1.multiprocess.engine_module import (
     HandlerSpec,
@@ -108,6 +111,11 @@ class ManagementModule:
                 self.report_block_allocations,
                 ThreadPoolType.NORMAL,
             ),
+            HandlerSpec(
+                RequestType.DRAIN_KV_EVENTS,
+                self.drain_kv_events,
+                ThreadPoolType.SYNC,
+            ),
         ]
 
     def report_status(self) -> dict:
@@ -168,6 +176,18 @@ class ManagementModule:
             for target in self._liveness_targets:
                 target.drop_instance_state(instance_id)
         return ThreadRunSummary(success=True, message=f"reaped={len(reaped)}")
+
+    def drain_kv_events(self) -> list[KvEventDrainRecord]:
+        """Return and clear the queued Dynamo KV events (connector sink).
+
+        Returns:
+            Queued ``KvEventDrainRecord``s oldest first, or ``[]`` when the
+            connector sink is not enabled.
+        """
+        queue = self._ctx.dynamo_kv_event_queue
+        if queue is None:
+            return []
+        return queue.drain()
 
     def get_chunk_size(self) -> int:
         """Return the chunk size used for KV cache operations.

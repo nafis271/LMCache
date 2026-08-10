@@ -169,6 +169,22 @@ class CustomizedSerdeConfig:
 
 
 @dataclass
+class KvEventDrainRecord:
+    """One KV cache event queued in the MP server for a connector drain.
+
+    ``kind`` is "stored" or "removed". For "removed", only ``block_hashes``
+    and ``medium`` are meaningful.
+    """
+
+    kind: str
+    block_hashes: list[int]
+    token_ids: list[int]
+    parent_hash: int | None
+    block_size: int
+    medium: str | None
+
+
+@dataclass
 class BlockAllocationRecord:
     """A single per-request GPU block allocation delta from vLLM."""
 

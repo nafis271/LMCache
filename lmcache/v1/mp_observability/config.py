@@ -98,6 +98,41 @@ class ObservabilityConfig:
     random UUID v4 at ``init_observability`` time. An explicit value is
     preserved verbatim."""
 
+    enable_dynamo_kv_events: bool = False
+    """Publish KV cache events (``BlockStored`` / ``BlockRemoved``) over ZMQ
+    in vLLM-compatible wire format, for consumption by a Dynamo-side relay
+    that forwards them into Dynamo's KV-aware router. Disabled by default."""
+
+    dynamo_kv_block_size: int = 16
+    """Block size advertised in published KV events. Must equal the inference
+    engine's block size so Dynamo's router indexes blocks consistently."""
+
+    dynamo_zmq_bind: str = "tcp://*:5557"
+    """ZMQ bind address the publisher listens on; the Dynamo-side relay
+    subscribes here. Only used when :attr:`enable_dynamo_kv_events` is set."""
+
+    dynamo_medium: str = "GPU"
+    """Storage-medium tag stamped on every emitted KV event. Defaults to
+    ``"GPU"`` to match vLLM's convention. Only used when
+    :attr:`enable_dynamo_kv_events` is set."""
+
+    dynamo_kv_sink: str = "zmq"
+    """Where Dynamo KV events go: "zmq" binds a PUB socket at
+    :attr:`dynamo_zmq_bind`; "connector" queues them in-process for the
+    vLLM-side LMCacheMPConnector to drain over the MP protocol
+    (``DRAIN_KV_EVENTS``), so they ride the engine's own KV-event stream."""
+
+    dynamo_hash_block_size: int | None = None
+    """Granularity (tokens) at which the engine chain-hashes blocks. vLLM
+    hybrid models resolve an internal kernel block size (e.g. 4 for DSv4) and
+    chain-hash at that granularity; events expose every Nth chain value. Must
+    divide dynamo_kv_block_size. None = single-shot per kv block."""
+
+    dynamo_dp_rank: int = 0
+    """Data-parallel rank stamped on every emitted KV event batch. v1 targets
+    the single-DP case and defaults to ``0``; multi-DP rank attribution is out
+    of scope for v1. Only used when :attr:`enable_dynamo_kv_events` is set."""
+
 
 DEFAULT_OBSERVABILITY_CONFIG = ObservabilityConfig(enabled=False)
 
@@ -283,6 +318,70 @@ def add_observability_args(
         "file under $TMPDIR when --trace-level is set without an explicit "
         "output path.",
     )
+    group.add_argument(
+        "--enable-dynamo-kv-events",
+        action="store_true",
+        default=False,
+        help=(
+            "Publish KV cache events (BlockStored/BlockRemoved) over ZMQ for "
+            "Dynamo's KV-aware router."
+        ),
+    )
+    group.add_argument(
+        "--dynamo-kv-block-size",
+        type=int,
+        default=16,
+        help=(
+            "Block size for published KV events; must equal the inference "
+            "engine's block size."
+        ),
+    )
+    group.add_argument(
+        "--dynamo-zmq-bind",
+        type=str,
+        default="tcp://*:5557",
+        help="ZMQ bind address the Dynamo-side relay connects to.",
+    )
+    group.add_argument(
+        "--dynamo-medium",
+        type=str,
+        default="GPU",
+        help=(
+            "Storage-medium tag stamped on emitted KV events. "
+            "Defaults to 'GPU' (vLLM's convention)."
+        ),
+    )
+    group.add_argument(
+        "--dynamo-kv-sink",
+        type=str,
+        choices=["zmq", "connector"],
+        default="zmq",
+        help=(
+            "Dynamo KV event sink: 'zmq' publishes on --dynamo-zmq-bind; "
+            "'connector' queues events for the vLLM-side connector to drain "
+            "(events then ride the engine's own KV-event publisher)."
+        ),
+    )
+    group.add_argument(
+        "--dynamo-hash-block-size",
+        type=int,
+        default=None,
+        help=(
+            "Engine chain-hash granularity in tokens (vLLM's resolved kernel "
+            "block size, e.g. 4 for DSv4 hybrids). Must divide "
+            "--dynamo-kv-block-size. Default: single-shot per kv block."
+        ),
+    )
+    group.add_argument(
+        "--dynamo-dp-rank",
+        type=int,
+        default=0,
+        help=(
+            "Data-parallel rank stamped on emitted KV event batches. v1 "
+            "targets single-DP and defaults to 0; multi-DP rank attribution "
+            "is out of scope for v1."
+        ),
+    )
 
     return parser
 
@@ -322,6 +421,13 @@ def parse_args_to_observability_config(
         extra_logging_interval=args.extra_logging_interval,
         trace_level=args.trace_level,
         trace_output=args.trace_output,
+        enable_dynamo_kv_events=args.enable_dynamo_kv_events,
+        dynamo_kv_block_size=args.dynamo_kv_block_size,
+        dynamo_zmq_bind=args.dynamo_zmq_bind,
+        dynamo_medium=args.dynamo_medium,
+        dynamo_hash_block_size=args.dynamo_hash_block_size,
+        dynamo_kv_sink=args.dynamo_kv_sink,
+        dynamo_dp_rank=args.dynamo_dp_rank,
     )
 
     if config.tracing_enabled and config.otlp_endpoint is None:
@@ -338,6 +444,18 @@ def parse_args_to_observability_config(
 
     if config.extra_logging_interval <= 0:
         raise ValueError("--extra-logging-interval must be > 0.")
+
+    if config.enable_dynamo_kv_events:
+        if not config.dynamo_zmq_bind:
+            raise ValueError(
+                "--enable-dynamo-kv-events requires a non-empty "
+                "--dynamo-zmq-bind for the publisher to bind to."
+            )
+        if config.dynamo_kv_block_size <= 0:
+            raise ValueError(
+                "--dynamo-kv-block-size must be a positive integer when "
+                f"--enable-dynamo-kv-events is set (got {config.dynamo_kv_block_size})."
+            )
 
     return config
 
