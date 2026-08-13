@@ -55,6 +55,7 @@ from lmcache.v1.platform.base.event_ipc import (
 )
 from lmcache.v1.platform.cache_context import create_cache_context
 import lmcache.c_ops as lmc_ops
+import lmcache.lmcache_native as lmcache_native
 
 logger = init_logger(__name__)
 _HAS_NATIVE_OBJECT_GROUP_TRANSFER: bool = hasattr(
@@ -287,7 +288,7 @@ def _run_object_group_transfer_plan(
     object_group_id: int,
     batch_size: int,
     skip_first_n_tokens: int,
-    direction: "lmc_ops.TransferDirection",
+    direction: "lmcache_native.TransferDirection",
 ) -> None:
     """Plan and execute one object group's transfer in a single native call.
 
@@ -319,7 +320,7 @@ def _run_object_group_transfer_plan(
     kv_groups_manager = cache_context.kv_layer_groups_manager
     object_group = kv_groups_manager.object_groups[object_group_id]
     kernel_group_ids = object_group.kernel_group_indices
-    is_h2d = direction == lmc_ops.TransferDirection.H2D
+    is_h2d = direction == lmcache_native.TransferDirection.H2D
     max_batch_size = cache_context.max_batch_size
 
     # --- Per-kernel-group invariants, resolved once (vs. every batch before) ---
@@ -458,7 +459,7 @@ def transfer_kv_per_object_group(
     object_group_id: int,
     batch_size: int,
     skip_first_n_tokens: int,
-    direction: "lmc_ops.TransferDirection",
+    direction: "lmcache_native.TransferDirection",
 ) -> None:
     """Helper function to transfer memory objects of a single object group
     to/from GPU, with batching support.
@@ -504,7 +505,7 @@ def transfer_kv_per_object_group(
     kv_groups_manager = cache_context.kv_layer_groups_manager
     object_group = kv_groups_manager.object_groups[object_group_id]
     kernel_group_ids = object_group.kernel_group_indices
-    is_h2d = direction == lmc_ops.TransferDirection.H2D
+    is_h2d = direction == lmcache_native.TransferDirection.H2D
 
     attn_desc = kv_groups_manager.get_attn_desc()
     num_objects_to_skip = 0
@@ -1204,7 +1205,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         object_group_id=obj_group_id,
                         batch_size=1,
                         skip_first_n_tokens=0,
-                        direction=lmc_ops.TransferDirection.D2H,
+                        direction=lmcache_native.TransferDirection.D2H,
                     )
 
                 store_succeeded = True
@@ -1433,7 +1434,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                             object_group_id=obj_group_id,
                             batch_size=cache_context.max_batch_size,
                             skip_first_n_tokens=skip_first_n_tokens,
-                            direction=lmc_ops.TransferDirection.H2D,
+                            direction=lmcache_native.TransferDirection.H2D,
                         )
                         # Extend only after the copy is enqueued: on exception,
                         # read_prefetched_results releases this group's locks
@@ -1491,22 +1492,26 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         """Publish one ``MP_TOKENS`` event for ``key``'s chunks.
 
         Pairs each complete chunk in ``[key.start, key.end)`` with its
-        ObjectKey chunk hash. Must be called at store submission — before
-        the write-finished events can reach the bus — so the cache-event
-        subscriber can stamp token ids onto the STORE entries. A store
-        that later fails leaves only unused cache entries (bounded).
+        ObjectKey chunk hash and token position. Must be called at store
+        submission, before the write-finished events reach the bus, so the
+        cache-event subscriber can stamp them onto the STORE entries. A
+        store that later fails leaves only unused cache entries.
 
         Args:
             key: The IPC key of the store being submitted.
             obj_keys: One ObjectKey per complete chunk, in chunk order.
         """
-        token_ids = list(key.token_ids)
+        # Complete chunks in [key.start, key.end) paired with the absolute
+        # position of each chunk's first token. Prefix-chained chunk hashes
+        # imply a position without revealing it, so it is reported here. A
+        # trailing partial chunk has no stored KV to bind to.
         chunk_size = self._ctx.chunk_size
+        token_ids = list(key.token_ids)
         effective_len = min(len(token_ids), key.end)
         num_complete = effective_len - effective_len % chunk_size
+        token_offsets = list(range(key.start, num_complete, chunk_size))
         token_chunks = [
-            token_ids[offset : offset + chunk_size]
-            for offset in range(key.start, num_complete, chunk_size)
+            token_ids[offset : offset + chunk_size] for offset in token_offsets
         ]
         if not token_chunks:
             return
@@ -1528,6 +1533,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 metadata={
                     "chunk_hashes": [obj_key.chunk_hash for obj_key in obj_keys],
                     "token_chunks": token_chunks,
+                    "token_offsets": token_offsets,
                 },
             )
         )
